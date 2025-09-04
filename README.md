@@ -115,15 +115,3 @@ frame,id,model_x,model_y,class,jersey
 
 ---
 
-## ⚙️ Key options & knobs
-
-- **Tracking**
-  - Players (BoT-SORT): `track_high_thresh=0.50`, `track_low_thresh=0.10`, `new_track_thresh=0.60`,  
-    `track_buffer=50`, `proximity_thresh=0.40`, `appearance_thresh=0.15` (GPU only).
-  - Ball (BoostTrack): `det_thresh=0.05`, `iou_threshold=0.00`, `min_hits=0`, `min_box_area=1`.
-- **Team clustering:** K-Means (2 clusters). Periodic refit every ~125 frames, reorder by field side.
-- **OCR:** PARSeq gated by **legibility** (ResNet34 classifier). Temporal **voting** with hysteresis and leaky decay.
-- **Calibration:** per-frame \(H_t\) with **stability gate** (median displacement thresholds).
-- **Analysis-Preprocessing:** off-pitch culling, minimum lifetime for player tracklets, jersey must be known for ID stitching.
-
----
