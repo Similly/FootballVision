@@ -29,6 +29,12 @@ pip install -r requirements.txt
 
 [Download: PARSeq_tiny Jersey OCR model](https://drive.google.com/file/d/1Xky1MpSMXt6KopSG24paXqxRNLbh3fJB/view?usp=drive_link)
 
+[Download: Resnet34 Player crop Legibility Classifier](https://drive.google.com/file/d/1aUF4f4T5FQTEpK5tBAoQi9U4dlVwPLZs/view?usp=sharing) ([Origin-Rep0](https://github.com/mkoshkina/jersey-number-pipeline))
+
+[Download: PnLCalib Keypoint Recognizer](https://drive.google.com/file/d/1VZtllKJKb5FeTOfR2cVGfQRjz4YzyUtm/view?usp=sharing) ([Origin-Repo](https://github.com/mguti97/PnLCalib))
+
+[Download: PnLCalib Line Recognizer](https://drive.google.com/file/d/1Y7S_Cvrt-KvPImQFLKCeVvTEYfPXTxrm/view?usp=sharing) ([Origin-Repo](https://github.com/mguti97/PnLCalib))
+
 ---
 
 ## 🚀 Quickstart
