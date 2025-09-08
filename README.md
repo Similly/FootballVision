@@ -26,6 +26,7 @@ pip install -r requirements.txt
 ```
 
 [Download: YOLOv8n Detection Model](https://drive.google.com/file/d/12IXHinCVM11RLdvfDjxtEtJCMhZ8gpx7/view?usp=drive_link)
+
 [Download: PARSeq_tiny Jersey OCR model](https://drive.google.com/file/d/1Xky1MpSMXt6KopSG24paXqxRNLbh3fJB/view?usp=drive_link)
 
 ---
