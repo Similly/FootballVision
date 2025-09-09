@@ -11,26 +11,22 @@ from PIL import Image
 from torchvision import models
 from torchvision import transforms as T
 from torchvision.models import ResNet34_Weights
-from types import SimpleNamespace
 from pathlib import Path
 from collections import Counter
 from ultralytics import YOLO
 from sklearn.cluster import KMeans
 from boxmot import BotSort, BoostTrack
 from collections import defaultdict, deque
-from paddleocr import PaddleOCR
 
 # === OCR-Parameter ===
 OCR_FRAME_GAP = 1                    # Keyframe-Sampling: alle N Frames
 MIN_PLAYER_H = 50                    # Mindesthöhe Spielerbox für OCR
-LAP_VAR_TH = 60.0                    # Schärfe-Grenze (Varianz des Laplacian)
-ROI_AR_MIN, ROI_AR_MAX = 0.35, 3.5   # Aspect Ratio Grenzen (w/h)
 AREA_GROWTH_TRIG = 1.4               # OCR triggern, wenn Boxfläche stark wächst
 CONF_MIN = 0.60                      # Mindestkonfidenz (nach Postprocess)
 LEAKY_DECAY = 0.001                  # Leaky pro Frame (kleiner Wert)
 
 DRAW_ROI = True
-ROI_COLORS = {"torso": (0, 255, 255), "full": (200, 200, 200)}  # BGR
+ROI_COLORS = {"torso": (0, 255, 255)}  # BGR
 ROI_THICK = 2
 
 LEGIBILITY_ENABLED = True
@@ -38,27 +34,16 @@ LEG_THR = 0.75
 LEG_MIN_H, LEG_MIN_W = 40, 40
 
 USE_PARSEQ = True
-PARSEQ_CKPT = "ocrModels/parseq_epoch=24-step=2575-val_accuracy=95.6044-val_NED=96.3255.ckpt"
-
-# === PARSeq: Recognizer-Transform ===
-_parseq_tf = T.Compose([
-    T.ToPILImage(),
-    T.Resize((32, 128), interpolation=T.InterpolationMode.BICUBIC),
-    T.ToTensor(),
-    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
+PARSEQ_CKPT = "ocrModels/epoch=4-step=665-val_accuracy=96.5800-val_NED=97.8600.ckpt"
 
 def make_parseq_transform(img_size, rotation=0, augment=False):
-    # exakt wie im Repo (ohne Augment bei Inferenz)
     trans = []
-    if augment:
-        pass  # rand_augment_transform() nur fürs Training
     if rotation:
         trans.append(lambda img: img.rotate(rotation, expand=True))
     trans.extend([
         T.Resize(img_size, T.InterpolationMode.BICUBIC),
         T.ToTensor(),
-        T.Normalize(0.5, 0.5)  # entspricht mean=[0.5]*3, std=[0.5]*3
+        T.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]),  # <-- fix
     ])
     return T.Compose(trans)
 
@@ -242,26 +227,12 @@ def read_number_from_roi(roi_bgr, ocr, conf_min=0.50):  # conf_min leicht gelock
 
     texts, scores, boxes, polys = [], [], None, None
 
-    # --- A) PaddleOCR ---
-    if hasattr(ocr, 'predict'):
-        print("PaddleOCR")
-        out = ocr.predict(pre_img)  # PaddleOCR 3.x
-        if not out:
-            return None
-        ocr_result = out[0] if isinstance(out, list) else out
-        texts  = ocr_result.get("rec_texts", []) or []
-        scores = ocr_result.get("rec_scores", []) or []
-        boxes  = ocr_result.get("rec_boxes", None)
-        polys  = ocr_result.get("rec_polys", None)
-
-    # --- B) PARSeq ---
-    else:
-        text, conf = parseq_infer_text(pre_img, ocr, device)  # device = global
-        texts  = [text]
-        scores = [conf]
-        boxes  = None
-        polys  = None
-        #print(f"[F{frame_idx} T{track_id} ROI=({rx1},{ry1},{rx2},{ry2})] PARSeq: {text} (conf={conf:.2f})")
+    text, conf = parseq_infer_text(pre_img, ocr, device)  # device = global
+    texts  = [text]
+    scores = [conf]
+    boxes  = None
+    polys  = None
+    #print(f"[F{frame_idx} T{track_id} ROI=({rx1},{ry1},{rx2},{ry2})] PARSeq: {text} (conf={conf:.2f})")
 
     if len(texts) == 0:
         return None
@@ -298,6 +269,77 @@ def read_number_from_roi(roi_bgr, ocr, conf_min=0.50):  # conf_min leicht gelock
     if best is None or best[1] < conf_min:
         return None
     return best  # (nummer, konfidenz)
+
+def load_parseq_from_ckpt(ckpt_path, device):
+    import string as _s
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+    # Keys vereinheitlichen
+    fixed = {}
+    for k, v in sd.items():
+        k = k.replace("module.", "").replace("_orig_mod.", "")
+        if not k.startswith("model."):
+            k = "model." + k
+        fixed[k] = v
+
+    # Architektur & Längen aus dem CKPT ableiten
+    pq = fixed["model.pos_queries"]           # [1, n_queries, d_model]
+    n_queries = pq.shape[1]
+    d_model   = pq.shape[2]
+    arch = "parseq_tiny" if d_model <= 192 else "parseq"
+    max_len = int(n_queries - 1)
+
+    head_out  = fixed["model.head.weight"].shape[0]
+    embed_num = fixed["model.text_embed.embedding.weight"].shape[0]
+
+    # Charset bestimmen
+    hp = ckpt.get("hyper_parameters", {})
+    if head_out == 11:
+        charset_str = _s.digits  # "0123456789"
+    else:
+        charset_str = hp.get("charset") or "".join([c for c in _s.printable if c not in "\t\n\r\x0b\x0c"])
+
+    # Modell instanziieren – mehrere API-Varianten probieren
+    def _build(**kw):
+        return torch.hub.load('baudm/parseq', arch, pretrained=False,
+                              trust_repo=True, max_label_length=max_len, **kw)
+
+    tried = []
+    for kw in ({"charset": charset_str},
+               {"charset_train": charset_str, "charset_test": charset_str},
+               {"charset": charset_str, "charset_train": charset_str, "charset_test": charset_str}):
+        try:
+            m = _build(**kw)
+            if (m.model.head.weight.shape[0] == head_out and
+                m.model.text_embed.embedding.weight.shape[0] == embed_num):
+                model = m
+                break
+        except Exception as e:
+            tried.append((kw, str(e)))
+    else:
+        # Fallback: danach Head/Embedding passend umbauen
+        model = _build()
+        model.model.head = torch.nn.Linear(d_model, head_out, bias=True)
+        model.model.text_embed.embedding = torch.nn.Embedding(embed_num, d_model)
+        try:
+            # Tokenizer auf Ziffern setzen, wenn digits-only
+            if head_out == 11:
+                model.tokenizer.set_charset(charset_str)
+        except Exception:
+            try:
+                model.tokenizer.charset = charset_str
+            except Exception:
+                pass
+
+    # Gewichte laden (nicht strikt!)
+    missing, unexpected = model.load_state_dict(fixed, strict=False)
+    if missing or unexpected:
+        print(f"[load_state_dict] missing={len(missing)} unexpected={len(unexpected)}")
+
+    model = model.to(device).eval()
+    tfm = make_parseq_transform(tuple(hp.get("img_size", (32,128))))
+    print(f"[PARSeq] arch={arch} d_model={d_model} max_len={max_len} head_out={head_out} embed_num={embed_num}")
+    return model, tfm
 
 def parseq_infer_text(bgr_roi, model, device):
         """Spiegelt die Inferenz aus dem Jersey-Repo:
@@ -517,54 +559,8 @@ for class_id in target_classes:
 
 #OCR init
 if USE_PARSEQ:
-    import string as _s
-    # 1) CKPT und Hyperparameter lesen
-    ckpt = torch.load(PARSEQ_CKPT, map_location='cpu', weights_only=False)
-    hp = ckpt.get('hyper_parameters', {})
-    decode_ar    = bool(hp.get('decode_ar', True))
-    refine_iters = int(hp.get('refine_iters', 0))
-
-    # 2) PARSeq-System wie im Repo bauen (ohne Pretrain), Test-Charset = Ziffern
-    parseq_sys = torch.hub.load(
-        'baudm/parseq', 'parseq',
-        pretrained=False,
-        charset=_s.digits,          # Jersey: nur Ziffern
-        decode_ar=decode_ar,
-        refine_iters=refine_iters
-    )
-
-    # 3) state_dict aus dem CKPT holen und Keys auf 'model.*' mappen
-    sd = ckpt.get('state_dict', ckpt.get('model', ckpt))
-    fixed_sd = {}
-    for k, v in sd.items():
-        k = k.replace('module.', '').replace('_orig_mod.', '')
-        if not k.startswith('model.'):
-            k = 'model.' + k
-        fixed_sd[k] = v
-
-    # 4) Laden (strict=True, damit wir sofort merken, falls was anderes nicht passt)
-    parseq_sys.load_state_dict(fixed_sd, strict=True)
-
-    # 5) Device + Eval
-    parseq_sys.to(device).eval()
-
-    # 2) Original-Transform (Resize -> ToTensor -> Normalize(0.5))
-    parseq_tf = make_parseq_transform(parseq_sys.hparams.img_size)
-
+    parseq_sys, parseq_tf = load_parseq_from_ckpt(PARSEQ_CKPT, device)
     ocr = parseq_sys
-else:
-    det_dir = os.path.expanduser("~/.paddlex/official_models/PP-OCRv5_mobile_det")
-    #rec_dir = os.path.expanduser("~/.paddlex/official_models/PP-OCRv5_mobile_rec")
-    rec_dir = os.path.expanduser("~/.paddlex/official_models/rec_jersey")
-    ocr = PaddleOCR(
-        text_detection_model_name='PP-OCRv5_mobile_det',          
-        #text_detection_model_dir=det_dir,        
-        text_recognition_model_name='PP-OCRv5_mobile_rec',        
-        text_recognition_model_dir=rec_dir,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False
-    )
 
 # === Legibility init (ResNet34) ===
 leg_device = device  # gleiches Device wie YOLO bei dir (aktuell CPU)
@@ -585,6 +581,8 @@ start_time = ti.time()
 detection_time = 0
 track_time = 0
 ocr_time = 0
+ocr_calls = 0         # players where do_ocr==True
+ocr_roi_calls = 0     # total ROI recognitions (PARSeq/Paddle calls)
 frame_idx = 0
 kits_clf = None
 left_label = None
@@ -732,6 +730,7 @@ while True:
             last_box_area[track_id] = max(last_box_area[track_id], area)
 
             if do_ocr:
+                ocr_calls += 1
                 t2 = ti.time()
                 # 0) Player-Crop + Legibility auf Player (Paper-Logik)
                 player_crop = frame[y1:y2, x1:x2]
@@ -755,6 +754,7 @@ while True:
                             cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), ROI_COLORS.get(tag, (200,200,200)), ROI_THICK)
 
                         # 2) PARSeq/Paddle auf Torso-ROI
+                        ocr_roi_calls += 1
                         out = read_number_from_roi(roi_img, ocr, conf_min=CONF_MIN)
                         if out is not None:
                             num, conf = out
@@ -772,7 +772,6 @@ while True:
                     maybe_assign_number(track_id)
                 frame_ocr_time += ti.time() - t2
             assigned = track_assigned_num.get(track_id, None)
-            ocr_time += frame_ocr_time
 
 
             # Zeichnen
@@ -785,9 +784,12 @@ while True:
             # Output puffern (conf aus Tracker unbekannt -> -1.0), extra = dom_team
             jersey_out = assigned if assigned is not None else -1
             output_rows.append((frame_idx, track_id, float(x1), float(y1), float(box_w), float(box_h), -1.0, dom_team, jersey_out))
-
+    ocr_time += frame_ocr_time
     frame_time = ti.time() - frame_time
-    print(f"Frame {frame_idx} Zeit: {frame_time*1000:.1f}s (Det: {frame_detection_time*1000:.1f}s, Track: {frame_track_time*1000:.1f}s, OCR: {frame_ocr_time*1000:.1f}s)")
+    print(f"Frame {frame_idx} Zeit: {frame_time*1000:.1f}ms "
+      f"(Det: {frame_detection_time*1000:.1f}ms, "
+      f"Track: {frame_track_time*1000:.1f}ms, "
+      f"OCR: {frame_ocr_time*1000:.1f}ms)")
 
     # Frame schreiben
     video_writer.write(frame)
@@ -885,9 +887,6 @@ for key, tids in key_to_tids.items():
             p_start, p_end = tid_span[prev]
             # keine zeitliche Überlappung: p_end < t_start
             if p_end < t_start:
-                gap = t_start - p_end
-                # Plausibilität: Gap klein genug & Distanz klein genug
-                _, p_last_box = tid_last[prev]
                 chain.append(t)
                 placed = True
                 break
@@ -925,6 +924,18 @@ with open(mot_file_path, 'w') as mot_writer:
         # 'extra' ist Team ('L'/'R'), '1'/'3'/'2' für GK/Ref/Ball etc.
         mot_writer.write(f"{frame_i},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},{conf_o:.2f},{extra},{jersey}\n")
 
-print(f"Fertig! Det {detection_time:.2f}s, Track {track_time:.2f}s, OCR {ocr_time:.2f}, Total {ti.time()-start_time:.2f}s")
+total_time = ti.time() - start_time
+other_time = total_time - (detection_time + track_time + ocr_time)
+avg_det_ms  = (detection_time / max(1, frame_idx)) * 1000
+avg_trk_ms  = (track_time     / max(1, frame_idx)) * 1000
+avg_ocr_ms  = (ocr_time       / max(1, frame_idx)) * 1000
+avg_tot_ms  = (total_time     / max(1, frame_idx)) * 1000
+fps_eff     = (frame_idx / total_time) if total_time > 0 else 0.0
+
+print("\n=== Runtime Summary ===")
+print(f"Frames: {frame_idx} | Duration: {total_time:.2f}s | FPS: {fps_eff:.2f}")
+print(f"Avg per frame [ms]  ->  Det: {avg_det_ms:.2f} | Track: {avg_trk_ms:.2f} | OCR: {avg_ocr_ms:.2f} | Total: {avg_tot_ms:.2f}")
+print(f"Time share [%]       ->  Det: {100*detection_time/total_time:.1f} | Track: {100*track_time/total_time:.1f} | OCR: {100*ocr_time/total_time:.1f} | Other: {100*other_time/total_time:.1f}")
+print(f"OCR calls: players={ocr_calls}, roi_calls={ocr_roi_calls}")
 print(f"Video: {output_video}")
 print(f"MOT-ähnlicher Output mit Jersey-Spalte: {mot_file_path}")

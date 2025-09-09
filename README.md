@@ -42,24 +42,28 @@ pip install -r requirements.txt
 ### 1) Detection + class-aware tracking (+ OCR)
 
 ```bash
-python scripts/tracking_pipeline.py \
+python -m tracking_pipeline.main \
   path/to/input_video.mp4
 ```
 
 **Outputs**
+
 - **Video preview** with overlays: `output/..._output_video.mp4`  
 - **Per-frame YOLO labels** (optional): `outputDet/<seq>/labels/000001.txt`  
 - **Tracking CSV (MOT-like w/ jersey):**
-  ```
+
+  ```python
   frame,id,x,y,w,h,conf,class,jersey
   ```
+
   - `class` is a string label (e.g., `'L'/'R'` for teams, `'2'` ball, `'3'` ref, …)
   - jersey `-1` means unknown
 
 ### 2) Camera calibration (PnLCalib → homographies)
 
 ```bash
-python PnLCalib/inference_modified.py \
+cd PnLCalib
+python inference_modified.py \
   --weights_kp weights/hrnetv2_w48_kp.pth \
   --weights_line weights/hrnetv2_w48_line.pth \
   --input_path path/to/input.mp4 \
@@ -69,15 +73,18 @@ python PnLCalib/inference_modified.py \
 ```
 
 **Output**
+
 - **Homographies CSV** with rows:
-  ```
+
+  ```python
   frame,H00,H01,H02,H10,H11,H12,H20,H21,H22
   ```
 
 ### 3) Map to 2D + overlay pitch
 
 ```bash
-python PnLCalib/transformandplotsmooth_modified.py \
+cd PnLCalib
+python transformandplotsmooth_modified.py \
   --video path/to/input.mp4 \
   --tracking path/to/tracking_results.txt \
   --transforms_csv output/homographies.csv \
@@ -86,16 +93,20 @@ python PnLCalib/transformandplotsmooth_modified.py \
 ```
 
 **Outputs**
+
 - **Overlay video** with a drawn pitch and 2D points  
 - **2D CSV**:
-  ```
+
+  ```python
   frame,id,model_x,model_y,class,jersey
   ```
-  where `model_x/y` are in meters on a **105×68 m** pitch. 
+
+  where `model_x/y` are in meters on a **105×68 m** pitch.
 
 ### 4) Analytics (notebook)
 
 Open `Analysis.ipynb` and point it to the **2D CSV** to compute:
+
 - distance & **speed zones**,
 - positional **heatmaps**,
 - **possession/pass proxy** (nearest-player rule to ball),
@@ -107,21 +118,23 @@ Open `Analysis.ipynb` and point it to the **2D CSV** to compute:
 ## 📄 Data formats
 
 **Tracking CSV (MOT-like, image coords):**
-```
+
+```python
 frame,id,x,y,w,h,conf,class,jersey
 # x,y,w,h are in pixels (top-left), 'class' is string label, jersey -1 = unknown
 ```
 
 **Homographies CSV (calibration):**
-```
+
+```python
 frame,H00,H01,H02,H10,H11,H12,H20,H21,H22
 ```
 
 **2D Positions CSV (metric pitch):**
-```
+
+```python
 frame,id,model_x,model_y,class,jersey
 # model_x in [0,105], model_y in [0,68] (after mapping and smoothing)
 ```
 
 ---
-
